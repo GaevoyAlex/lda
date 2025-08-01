@@ -1,0 +1,24 @@
+[project]
+name = "liberandum-data-aggregator"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "voutsider@tutanota.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dynaconf (>=3.2.11,<4.0.0)",
+    "pydantic (>=2.11.7,<3.0.0)",
+    "scheduler (>=0.8.8,<0.9.0)",
+    "boto3 (>=1.39.3,<2.0.0)",
+    "coingecko-sdk (>=1.4.2,<2.0.0)",
+    "streamlit (>=1.46.1,<2.0.0)",
+    "schedule (>=1.2.2,<2.0.0)",
+    "aiohttp (>=3.12.13,<4.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
