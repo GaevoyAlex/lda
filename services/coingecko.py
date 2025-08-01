@@ -2,11 +2,9 @@ import requests
 import time
 import asyncio
 import aiohttp
-from uuid import uuid4
 from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aws.repositories.exchange_repository import ExchangeRepository
 from aws.repositories.platform_repository import PlatformRepository
@@ -24,6 +22,10 @@ from models.exchanges_stats import ExchangesStats
 class CoingeckoAggregator:
     BASE_URL = "https://api.coingecko.com/api/v3"
     PRO_BASE_URL = "https://pro-api.coingecko.com/api/v3"
+    
+    REQUEST_TIMEOUT = 10
+    BATCH_SIZE = 50
+    EXCHANGE_BATCH_SIZE = 20
 
     def __init__(self, 
                  api_key: str = settings.Coingecko.API_KEY, 
@@ -37,6 +39,9 @@ class CoingeckoAggregator:
             "X-Cg-Pro-Api-Key": self.api_key
         }
         
+        self._init_repositories()
+
+    def _init_repositories(self):
         self.token_repo = TokensRepository()
         self.platform_repo = PlatformRepository()
         self.exchange_repo = ExchangeRepository()
@@ -46,16 +51,23 @@ class CoingeckoAggregator:
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Any:
         url = f"{self.base_url}/{endpoint}"
         try:
-            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            response = requests.get(
+                url, 
+                headers=self.headers, 
+                params=params, 
+                timeout=self.REQUEST_TIMEOUT
+            )
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException:
             return None
 
-    async def _make_async_request(self, session: aiohttp.ClientSession, endpoint: str, params: Optional[Dict] = None) -> Any:
+    async def _make_async_request(self, session: aiohttp.ClientSession, 
+                                endpoint: str, params: Optional[Dict] = None) -> Any:
         url = f"{self.base_url}/{endpoint}"
         try:
-            async with session.get(url, headers=self.headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            timeout = aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT)
+            async with session.get(url, headers=self.headers, params=params, timeout=timeout) as response:
                 if response.status == 200:
                     return await response.json()
                 return None
@@ -134,39 +146,35 @@ class CoingeckoAggregator:
 
         print(f"Received {len(market_coins)} tokens in {time.time() - start_time:.2f}s")
 
-        process_start = time.time()
-        updated_count = 0
-        failed_count = 0
+        stats_batch = self._process_market_coins(market_coins)
+        updated_count, failed_count = self._save_token_stats_batch(stats_batch)
 
+        total_time = time.time() - start_time
+        print(f"Completed: {updated_count} saved, {failed_count} failed in {total_time:.2f}s")
+
+    def _process_market_coins(self, market_coins: List[Dict]) -> List[TokenStats]:
         stats_batch = []
         for market_coin in market_coins:
             try:
                 stats = self._create_token_stats_from_market(market_coin)
                 if stats:
                     stats_batch.append(stats)
-                    updated_count += 1
-                else:
-                    failed_count += 1
-            except Exception as e:
-                failed_count += 1
-                if failed_count <= 5:
-                    print(f"Error processing {market_coin.get('symbol', 'unknown')}: {e}")
+            except Exception:
+                continue
+        return stats_batch
 
-        batch_start = time.time()
-        saved_count = 0
+    def _save_token_stats_batch(self, stats_batch: List[TokenStats]) -> tuple:
+        updated_count = 0
+        failed_count = 0
+        
         for stats in stats_batch:
             try:
                 self.token_stats_repo.create_or_update(stats)
-                saved_count += 1
-            except Exception as e:
-                print(f"Error saving {stats.symbol}: {e}")
-
-        total_time = time.time() - start_time
-        process_time = batch_start - process_start
-        save_time = time.time() - batch_start
-
-        print(f"Completed: {saved_count} saved, {failed_count} failed")
-        print(f"Timing: Total {total_time:.2f}s (Process: {process_time:.2f}s, Save: {save_time:.2f}s)")
+                updated_count += 1
+            except Exception:
+                failed_count += 1
+                
+        return updated_count, failed_count
 
     def update_exchanges_stats_every_10_seconds(self, limit: int = 100) -> None:
         print(f"Updating ExchangesStats from list data (limit: {limit})...")
@@ -179,6 +187,12 @@ class CoingeckoAggregator:
         
         print(f"Received {len(exchanges_list)} exchanges in {time.time() - start_time:.2f}s")
         
+        updated_count, failed_count = self._process_exchanges_list(exchanges_list)
+        
+        total_time = time.time() - start_time
+        print(f"Completed: {updated_count} updated, {failed_count} failed in {total_time:.2f}s")
+
+    def _process_exchanges_list(self, exchanges_list: List[Dict]) -> tuple:
         updated_count = 0
         failed_count = 0
         
@@ -186,77 +200,105 @@ class CoingeckoAggregator:
             try:
                 self._save_exchange_stats_from_list(exchange_data)
                 updated_count += 1
-            except Exception as e:
+            except Exception:
                 failed_count += 1
-                if failed_count <= 3:
-                    print(f"Error processing {exchange_data.get('name', 'unknown')}: {e}")
-        
-        total_time = time.time() - start_time
-        print(f"Completed: {updated_count} updated, {failed_count} failed in {total_time:.2f}s")
+                
+        return updated_count, failed_count
 
     async def collect_tokens_detailed_info_daily_async(self, limit: int = 500) -> None:
         print(f"Collecting detailed info for tokens (daily task, limit: {limit})...")
         start_time = time.time()
         
-        all_token_stats = self.token_stats_repo.get_all()
-        coingecko_ids = list(set([ts.get('coingecko_id') for ts in all_token_stats if ts.get('coingecko_id')]))
-        
+        coingecko_ids = self._get_token_coingecko_ids(limit)
         if not coingecko_ids:
             print("No tokens found in TokenStats")
             return
         
         print(f"Found {len(coingecko_ids)} unique tokens to process")
-        saved_count = 0
-        failed_count = 0
-        total_to_process = min(len(coingecko_ids), limit)
-        coingecko_ids = coingecko_ids[:limit]
         
-        batch_size = 50
-        
-        async with aiohttp.ClientSession() as session:
-            for i in range(0, len(coingecko_ids), batch_size):
-                batch = coingecko_ids[i:i + batch_size]
-                tasks = [self._save_token_detailed_info_async(session, coin_id) for coin_id in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in results:
-                    if result and not isinstance(result, Exception):
-                        saved_count += 1
-                    else:
-                        failed_count += 1
-                
-                if (i + batch_size) % 100 == 0 or (i + batch_size) >= len(coingecko_ids):
-                    elapsed = time.time() - start_time
-                    processed = min(i + batch_size, len(coingecko_ids))
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    eta = (total_to_process - processed) / rate if rate > 0 else 0
-                    print(f"Progress: {processed}/{total_to_process} ({rate:.1f}/s, ETA: {eta:.0f}s)")
-                
-                await asyncio.sleep(0.5)
+        saved_count, failed_count = await self._process_tokens_detailed_async(coingecko_ids, start_time)
 
         total_time = time.time() - start_time
         print(f"Completed in {total_time:.2f}s: {saved_count} saved, {failed_count} failed")
+
+    def _get_token_coingecko_ids(self, limit: int) -> List[str]:
+        all_token_stats = self.token_stats_repo.get_all()
+        coingecko_ids = list(set([
+            ts.get('coingecko_id') for ts in all_token_stats 
+            if ts.get('coingecko_id')
+        ]))
+        return coingecko_ids[:limit]
+
+    async def _process_tokens_detailed_async(self, coingecko_ids: List[str], start_time: float) -> tuple:
+        saved_count = 0
+        failed_count = 0
+        total_to_process = len(coingecko_ids)
+        
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(coingecko_ids), self.BATCH_SIZE):
+                batch = coingecko_ids[i:i + self.BATCH_SIZE]
+                tasks = [self._save_token_detailed_info_async(session, coin_id) for coin_id in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                batch_saved, batch_failed = self._count_results(results)
+                saved_count += batch_saved
+                failed_count += batch_failed
+                
+                self._log_progress(i + self.BATCH_SIZE, len(coingecko_ids), total_to_process, start_time)
+                await asyncio.sleep(0.5)
+
+        return saved_count, failed_count
+
+    def _count_results(self, results: List) -> tuple:
+        saved_count = 0
+        failed_count = 0
+        
+        for result in results:
+            if result and not isinstance(result, Exception):
+                saved_count += 1
+            else:
+                failed_count += 1
+                
+        return saved_count, failed_count
+
+    def _log_progress(self, processed: int, total_ids: int, total_to_process: int, start_time: float):
+        if processed % 100 == 0 or processed >= total_ids:
+            elapsed = time.time() - start_time
+            rate = min(processed, total_ids) / elapsed if elapsed > 0 else 0
+            eta = (total_to_process - min(processed, total_ids)) / rate if rate > 0 else 0
+            print(f"Progress: {min(processed, total_ids)}/{total_to_process} ({rate:.1f}/s, ETA: {eta:.0f}s)")
 
     async def collect_exchanges_detailed_info_daily_async(self, limit: int = 100) -> None:
         print(f"Collecting detailed info for exchanges (daily task, limit: {limit})...")
         start_time = time.time()
         
-        all_exchange_stats = self.exchanges_stats_repo.get_all()
-        exchange_names = list(set([es.get('name') for es in all_exchange_stats if es.get('name')]))
-        
+        exchange_names = self._get_exchange_names(limit)
         if not exchange_names:
             print("No exchanges found in ExchangeStats")
             return
         
         print(f"Found {len(exchange_names)} exchanges to process")
+        
+        saved_count, failed_count = await self._process_exchanges_detailed_async(exchange_names)
+
+        total_time = time.time() - start_time
+        print(f"Successfully saved detailed info for {saved_count} exchanges in {total_time:.2f}s, {failed_count} failed")
+
+    def _get_exchange_names(self, limit: int) -> List[str]:
+        all_exchange_stats = self.exchanges_stats_repo.get_all()
+        exchange_names = list(set([
+            es.get('name') for es in all_exchange_stats 
+            if es.get('name')
+        ]))
+        return exchange_names[:limit]
+
+    async def _process_exchanges_detailed_async(self, exchange_names: List[str]) -> tuple:
         saved_count = 0
         failed_count = 0
-        batch_size = 20
-        exchange_names = exchange_names[:limit]
         
         async with aiohttp.ClientSession() as session:
-            for i in range(0, len(exchange_names), batch_size):
-                batch = exchange_names[i:i + batch_size]
+            for i in range(0, len(exchange_names), self.EXCHANGE_BATCH_SIZE):
+                batch = exchange_names[i:i + self.EXCHANGE_BATCH_SIZE]
                 tasks = []
                 
                 for exchange_name in batch:
@@ -265,42 +307,22 @@ class CoingeckoAggregator:
                 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                for result in results:
-                    if result and not isinstance(result, Exception):
-                        saved_count += 1
-                    else:
-                        failed_count += 1
+                batch_saved, batch_failed = self._count_results(results)
+                saved_count += batch_saved
+                failed_count += batch_failed
                 
-                processed = min(i + batch_size, len(exchange_names))
+                processed = min(i + self.EXCHANGE_BATCH_SIZE, len(exchange_names))
                 print(f"Processed {processed}/{len(exchange_names)} exchanges")
                 
                 await asyncio.sleep(0.5)
-
-        total_time = time.time() - start_time
-        print(f"Successfully saved detailed info for {saved_count} exchanges in {total_time:.2f}s, {failed_count} failed")
+                
+        return saved_count, failed_count
 
     def collect_tokens_detailed_info_daily(self, limit: int = 500) -> None:
         asyncio.run(self.collect_tokens_detailed_info_daily_async(limit))
 
     def collect_exchanges_detailed_info_daily(self, limit: int = 100) -> None:
         asyncio.run(self.collect_exchanges_detailed_info_daily_async(limit))
-
-    def _calculate_tvl(self, market_data: Dict) -> Optional[str]:
-        try:
-            market_cap = market_data.get('market_cap', {}).get('usd')
-            total_volume = market_data.get('total_volume', {}).get('usd')
-            circulating_supply = market_data.get('circulating_supply')
-            current_price = market_data.get('current_price', {}).get('usd')
-            
-            if market_cap and total_volume and circulating_supply and current_price:
-                velocity = total_volume / market_cap if market_cap > 0 else 0
-                tvl_factor = max(0.1, min(2.0, 1 / (1 + velocity * 10)))
-                estimated_tvl = market_cap * tvl_factor * 0.3
-                return str(round(estimated_tvl, 2))
-                
-            return None
-        except:
-            return None
 
     def _create_token_stats_from_market(self, market_coin: Dict) -> Optional[TokenStats]:
         try:
@@ -312,11 +334,7 @@ class CoingeckoAggregator:
 
             market_cap_usd = market_coin.get('market_cap')
             volume_24h_usd = market_coin.get('total_volume')
-            liquidity_score = None
-
-            if market_cap_usd and volume_24h_usd and market_cap_usd > 0:
-                liquidity_score = str(round((volume_24h_usd / market_cap_usd) * 100, 4))
-
+            liquidity_score = self._calculate_liquidity_score(market_cap_usd, volume_24h_usd)
             tvl = self._calculate_tvl_from_market(market_coin)
 
             return TokenStats(
@@ -339,20 +357,23 @@ class CoingeckoAggregator:
         except Exception:
             return None
 
+    def _calculate_liquidity_score(self, market_cap_usd: float, volume_24h_usd: float) -> Optional[str]:
+        if market_cap_usd and volume_24h_usd and market_cap_usd > 0:
+            return str(round((volume_24h_usd / market_cap_usd) * 100, 4))
+        return None
+
     def _calculate_tvl_from_market(self, market_coin: Dict) -> Optional[str]:
         try:
             market_cap = market_coin.get('market_cap')
             total_volume = market_coin.get('total_volume')
-            circulating_supply = market_coin.get('circulating_supply')
-            current_price = market_coin.get('current_price')
             
-            if market_cap and total_volume and circulating_supply and current_price:
-                velocity = total_volume / market_cap if market_cap > 0 else 0
-                tvl_factor = max(0.1, min(2.0, 1 / (1 + velocity * 10)))
-                estimated_tvl = market_cap * tvl_factor * 0.3
-                return str(round(estimated_tvl, 2))
+            if not market_cap or not total_volume:
+                return None
                 
-            return None
+            velocity = total_volume / market_cap if market_cap > 0 else 0
+            tvl_factor = max(0.1, min(2.0, 1 / (1 + velocity * 10)))
+            estimated_tvl = market_cap * tvl_factor * 0.3
+            return str(round(estimated_tvl, 2))
         except:
             return None
 
@@ -377,7 +398,6 @@ class CoingeckoAggregator:
             )
             
             self.exchanges_stats_repo.create_or_update(stats)
-            
         except Exception:
             pass
 
@@ -387,79 +407,42 @@ class CoingeckoAggregator:
             return None
 
         try:
-            links = coin_details.get('links', {})
-            
-            token = Token(
-                name=coin_details.get('name'),
-                coingecko_id=coin_details.get('id'),
-                symbol=coin_details.get('symbol', '').upper(),
-                description=self._get_description(coin_details.get('description', {})),
-                website=self._get_first_link(links.get('homepage', [])),
-                twitter=self._format_twitter_link(links.get('twitter_screen_name')),
-                facebook=self._format_facebook_link(links.get('facebook_username')),
-                reddit=links.get('subreddit_url'),
-                repo_link=self._get_first_link(links.get('repos_url', {}).get('github', [])),
-                avatar_image=coin_details.get('image', {}).get('large'),
-                instagram=self._format_instagram_link(links.get('instagram_username')),
-                discord=links.get('discord'),
-                whitelabel_link=self._get_first_link(links.get('whitepaper', []))
-            )
-            
+            token = self._create_token_from_details(coin_details)
             saved_token = self.token_repo.create_if_not_exists(token)
-            
-            platforms = coin_details.get('platforms', {})
-            for platform_name, address in platforms.items():
-                if address and address.strip():
-                    platform = Platform(
-                        token_id=saved_token['id'],
-                        name=platform_name,
-                        token_address=address
-                    )
-                    self.platform_repo.create_if_not_exists(platform)
-            
+            self._save_token_platforms(coin_details, saved_token['id'])
             return saved_token
         except Exception:
             return None
 
-    def _save_token_detailed_info(self, coingecko_id: str) -> Optional[Dict]:
-        coin_details = self.get_coin_details(coingecko_id)
-        if not coin_details:
-            return None
+    def _create_token_from_details(self, coin_details: Dict) -> Token:
+        links = coin_details.get('links', {})
+        
+        return Token(
+            name=coin_details.get('name'),
+            coingecko_id=coin_details.get('id'),
+            symbol=coin_details.get('symbol', '').upper(),
+            description=self._get_description(coin_details.get('description', {})),
+            website=self._get_first_link(links.get('homepage', [])),
+            twitter=self._format_twitter_link(links.get('twitter_screen_name')),
+            facebook=self._format_facebook_link(links.get('facebook_username')),
+            reddit=links.get('subreddit_url'),
+            repo_link=self._get_first_link(links.get('repos_url', {}).get('github', [])),
+            avatar_image=coin_details.get('image', {}).get('large'),
+            instagram=self._format_instagram_link(links.get('instagram_username')),
+            discord=links.get('discord'),
+            whitelabel_link=self._get_first_link(links.get('whitepaper', []))
+        )
 
-        try:
-            links = coin_details.get('links', {})
-            
-            token = Token(
-                name=coin_details.get('name'),
-                coingecko_id=coin_details.get('id'),
-                symbol=coin_details.get('symbol', '').upper(),
-                description=self._get_description(coin_details.get('description', {})),
-                website=self._get_first_link(links.get('homepage', [])),
-                twitter=self._format_twitter_link(links.get('twitter_screen_name')),
-                facebook=self._format_facebook_link(links.get('facebook_username')),
-                reddit=links.get('subreddit_url'),
-                repo_link=self._get_first_link(links.get('repos_url', {}).get('github', [])),
-                avatar_image=coin_details.get('image', {}).get('large'),
-                instagram=self._format_instagram_link(links.get('instagram_username')),
-                discord=links.get('discord'),
-                whitelabel_link=self._get_first_link(links.get('whitepaper', []))
-            )
-            
-            saved_token = self.token_repo.create_if_not_exists(token)
-            
-            platforms = coin_details.get('platforms', {})
-            for platform_name, address in platforms.items():
-                if address and address.strip():
-                    platform = Platform(
-                        token_id=saved_token['id'],
-                        name=platform_name,
-                        token_address=address
-                    )
-                    self.platform_repo.create_if_not_exists(platform)
-            
-            return saved_token
-        except Exception:
-            return None
+    def _save_token_platforms(self, coin_details: Dict, token_id: str):
+        platforms = coin_details.get('platforms', {})
+        for platform_name, address in platforms.items():
+            if address and address.strip():
+                platform = Platform(
+                    token_id=token_id,
+                    name=platform_name,
+                    token_address=address
+                )
+                self.platform_repo.create_if_not_exists(platform)
 
     async def _save_exchange_detailed_info_async(self, session: aiohttp.ClientSession, exchange_id: str) -> Optional[Dict]:
         try:
@@ -479,33 +462,7 @@ class CoingeckoAggregator:
                 native_token_symbol=exchange_details.get('native_coin_id')
             )
             
-            saved_exchange = self.exchange_repo.create_if_not_exists(exchange)
-            return saved_exchange
-            
-        except Exception:
-            return None
-
-    def _save_exchange_detailed_info(self, exchange_id: str) -> Optional[Dict]:
-        try:
-            exchange_details = self.get_exchange_details(exchange_id)
-            if not exchange_details:
-                return None
-            
-            exchange = Exchange(
-                name=exchange_details.get('name'),
-                description=exchange_details.get('description'),
-                website=exchange_details.get('url'),
-                facebook=exchange_details.get('facebook_url'),
-                reddit=exchange_details.get('reddit_url'),
-                twitter=self._format_twitter_handle(exchange_details.get('twitter_handle')),
-                avatar_image=exchange_details.get('image'),
-                trading_pairs_count=exchange_details.get('trade_volume_24h_btc_normalized'),
-                native_token_symbol=exchange_details.get('native_coin_id')
-            )
-            
-            saved_exchange = self.exchange_repo.create_if_not_exists(exchange)
-            return saved_exchange
-            
+            return self.exchange_repo.create_if_not_exists(exchange)
         except Exception:
             return None
 
@@ -521,29 +478,24 @@ class CoingeckoAggregator:
         return filtered_links[0] if filtered_links else None
 
     def _format_twitter_link(self, username: str) -> Optional[str]:
-        if not username or not username.strip():
-            return None
-        return f"https://twitter.com/{username.strip()}"
+        return self._format_social_link(username, "https://twitter.com/")
 
     def _format_twitter_handle(self, handle: str) -> Optional[str]:
-        if not handle or not handle.strip():
-            return None
-        return f"https://twitter.com/{handle.strip()}"
+        return self._format_social_link(handle, "https://twitter.com/")
 
     def _format_facebook_link(self, username: str) -> Optional[str]:
-        if not username or not username.strip():
-            return None
-        return f"https://facebook.com/{username.strip()}"
+        return self._format_social_link(username, "https://facebook.com/")
 
     def _format_instagram_link(self, username: str) -> Optional[str]:
+        return self._format_social_link(username, "https://instagram.com/")
+
+    def _format_social_link(self, username: str, base_url: str) -> Optional[str]:
         if not username or not username.strip():
             return None
-        return f"https://instagram.com/{username.strip()}"
+        return f"{base_url}{username.strip()}"
 
     def _safe_str(self, value) -> Optional[str]:
-        if value is None:
-            return None
-        return str(value)
+        return str(value) if value is not None else None
 
     def _name_to_id(self, name: str) -> str:
         return name.lower().replace(' ', '-').replace('(', '').replace(')', '').replace('.', '')

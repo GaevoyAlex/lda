@@ -1,64 +1,40 @@
-class Tokens:
+class BaseTableSchema:
+    attribute_definitions = [
+        {"AttributeName": "id", "AttributeType": "S"},
+    ]
+    key_schema = [
+        {"AttributeName": "id", "KeyType": "HASH"},
+    ]
+    provisioned_throughput = {
+        'ReadCapacityUnits': 5,
+        'WriteCapacityUnits': 5
+    }
+
+
+class Tokens(BaseTableSchema):
     table_name = 'LiberandumAggregationToken'
-    attribute_definitions = [
-        {"AttributeName": "id", "AttributeType": "S"},
-    ]
-    key_schema = [
-        {"AttributeName": "id", "KeyType": "HASH"},
-    ]
-    provisioned_throughput = {
-        'ReadCapacityUnits': 5,
-        'WriteCapacityUnits': 5
-    }
 
-class TokenPlatform:
+
+class TokenPlatform(BaseTableSchema):
     table_name = 'LiberandumAggregationTokenPlatform'
-    attribute_definitions = [
-        {"AttributeName": "id", "AttributeType": "S"},
-    ]
-    key_schema = [
-        {"AttributeName": "id", "KeyType": "HASH"},
-    ]
-    provisioned_throughput = {
-        'ReadCapacityUnits': 5,
-        'WriteCapacityUnits': 5
-    }
 
-class TokenStats:
+
+class TokenStats(BaseTableSchema):
     table_name = 'LiberandumAggregationTokenStats'
-    attribute_definitions = [
-        {"AttributeName": "id", "AttributeType": "S"},
-    ]
-    key_schema = [
-        {"AttributeName": "id", "KeyType": "HASH"},
-    ]
-    provisioned_throughput = {
-        'ReadCapacityUnits': 5,
-        'WriteCapacityUnits': 5
-    }
 
-class Exchanges:
+
+class Exchanges(BaseTableSchema):
     table_name = 'LiberandumAggregationExchanges'
-    attribute_definitions = [
-        {"AttributeName": "id", "AttributeType": "S"},
-    ]
-    key_schema = [
-        {"AttributeName": "id", "KeyType": "HASH"},
-    ]
-    provisioned_throughput = {
-        'ReadCapacityUnits': 5,
-        'WriteCapacityUnits': 5
-    }
 
-class ExchangesStats:
+
+class ExchangesStats(BaseTableSchema):
     table_name = 'LiberandumAggregationExchangesStats'
-    attribute_definitions = [
-        {"AttributeName": "id", "AttributeType": "S"},
-    ]
-    key_schema = [
-        {"AttributeName": "id", "KeyType": "HASH"},
-    ]
-    provisioned_throughput = {
-        'ReadCapacityUnits': 5,
-        'WriteCapacityUnits': 5
-    }
+
+
+TABLE_SCHEMAS = [
+    Tokens,
+    TokenStats, 
+    TokenPlatform,
+    Exchanges,
+    ExchangesStats
+]
